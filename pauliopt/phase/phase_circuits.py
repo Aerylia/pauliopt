@@ -5,6 +5,7 @@
 from collections import deque
 from itertools import islice
 from math import ceil, log10
+from this import s
 from typing import (Any, Callable, cast, Collection, Dict, FrozenSet, Iterator, List,
                     Literal, Mapping, Optional, overload, Sequence, Set, Tuple, Union)
 import numpy as np
@@ -200,6 +201,35 @@ class PhaseGadget:
             Readonly property exposing the qubits spanned by this phase gadget.
         """
         return self._qubits
+
+    def push_CX_through(self, ctrl: int, trgt: int) -> None:
+        """
+            Acts on the gadget as if a CX gate is pushed through it 
+            and adjusts the legs accordingly.
+            
+            For Z PhaseGadgets: 
+                if trgt qubit is also a leg
+                then ctrl qubit gets a leg if it didn't 
+                    or ctrl qubit loses a leg if it had one
+            For X PhaseGadgets:
+                if ctrl qubit is also a leg
+                then trgt qubit gets a leg if it didn't
+                    or trgt qubit loses a leg if it had one.
+        """
+        qubits = [q for q in self.qubits]
+        if self.basis == "Z":
+            leg_to_check = ctrl
+            leg_to_change = trgt
+        elif self.basis == "X":
+            leg_to_check = ctrl
+            leg_to_change = trgt
+        if leg_to_check in qubits:
+            if leg_to_change in qubits:
+                qubits.remove(leg_to_change)
+            else:
+                qubits.append(leg_to_change)
+        self._qubits = frozenset(qubits)
+
 
     def cx_count(self, topology: Topology, *,
                  mapping: Optional[Union[Sequence[int], Dict[int, int]]] = None) -> int:
@@ -839,7 +869,7 @@ class PhaseCircuit(Sequence[PhaseGadget]):
         ]
         return PhaseCircuit(self._num_qubits, remapped_gadgets)
 
-    def to_qiskit(self, topology: Topology) -> Any:
+    def to_qiskit(self, topology: Topology, method: Literal["naive", "paritysynth"] = "paritysynth") -> Any:
         """
             Returns this circuit as a Qiskit circuit.
 
@@ -855,9 +885,88 @@ class PhaseCircuit(Sequence[PhaseGadget]):
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("You must install the 'qiskit' library.") from e
         circuit = QuantumCircuit(self.num_qubits)
-        for gadget in self.gadgets:
-            gadget.on_qiskit_circuit(topology, circuit)
+        if method == "naive":
+            for gadget in self.gadgets:
+                gadget.on_qiskit_circuit(topology, circuit)
+        elif method == "paritysynth":
+            self._paritysynth(topology, circuit)
+        else:
+            raise TypeError("Expected one of 'naive', 'steiner-graysynth', 'paritysynth, found {method}.")
         return circuit
+
+    def _paritysynth(self, topology: Topology, circuit: Any) -> None:
+        """
+            Implementation for synthesizing the this PhaseCircuit 
+            to a Qiskit Quantum circuit using the method from 
+            https://doi.org/10.1088/2058-9565/ac5a0e
+            Constrained by the given architectural topology.
+        """
+        try:
+            from qiskit.circuit import QuantumCircuit # type: ignore
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("You must install the 'qiskit' library.") from e
+        if not isinstance(circuit, QuantumCircuit):
+            raise TypeError("Argument 'circuit' must be of type "
+                            "`qiskit.circuit.QuantumCircuit`.")
+        if not isinstance(topology, Topology):
+            raise TypeError(f"Expected Topology, found {type(topology)}.")
+
+        gadgets = [g for g in self.gadgets]
+        CX_aggregate = []
+
+        while len(gadgets) > 0:
+            # Pick the cheapest gadget
+            gadget = gadgets[np.argmin([g.cx_count(topology) for g in gadgets])]
+            # Remove that parity from the matrix
+            gadgets.remove(gadget)
+            # Find the terminals in the parity
+            terminals = gadget.qubits
+
+            # Build a SteinerTree
+            mst_branches = _prims_algorithm_branches(terminals,
+                                                 lambda u, v: 4*topology.dist(u, v)-2,
+                                                 4*len(topology.qubits)-2)
+            upper_ladder: List[Tuple[int, int]] = []
+            if len(terminals) == 1:
+                q0 = next(iter(terminals))
+            else:
+                q0 = min(*terminals)
+            if mst_branches:
+                incident: Dict[int, Set[Tuple[int, int]]] = {
+                    q: set() for q in terminals
+                }
+                for fst, snd in mst_branches:
+                    incident[fst].add((fst, snd))
+                    incident[snd].add((snd, fst))
+                # Create ladder of CX gates:
+                visited: Set[int] = set()
+                queue = deque([q0])
+                while queue:
+                    q = queue.popleft()
+                    visited.add(q)
+                    for tail, head in incident[q]:
+                        if head not in visited:
+                            if gadget.basis == "Z":
+                                upper_ladder.append((head, tail))
+                            else:
+                                upper_ladder.append((tail, head))
+                            queue.append(head)
+            for ctrl, trgt in reversed(upper_ladder):
+                circuit.cx(ctrl, trgt)
+            if gadget.basis == "Z":
+                circuit.rz(gadget.angle.to_qiskit, q0)
+            else:
+                circuit.rx(gadget.angle.to_qiskit, q0)
+            # Push the upper CX laddder through the remaining gadgets
+            for ctrl, trgt in upper_ladder:
+                for g in gadgets:
+                    g.push_CX_through(ctrl, trgt)
+                CX_aggregate.append((ctrl, trgt))
+        # TODO Optimize the CX_aggregate through re-synthesis
+        #       Maybe we want to do this optimization later and include the annealing CXs.
+        for ctrl, trgt in CX_aggregate:
+            circuit.cx(ctrl, trgt)
+
 
     @overload
     def to_svg(self, *,

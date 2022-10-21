@@ -5,7 +5,7 @@
 
 from collections import deque
 from math import ceil, log10
-from typing import (Callable, Deque, Dict, List, Optional, Protocol,
+from typing import (Callable, Deque, Dict, List, Literal, Optional, Protocol,
                     runtime_checkable, Set, Tuple, TypedDict, Union)
 import numpy as np # type: ignore
 from pauliopt.phase.phase_circuits import PhaseCircuit, PhaseCircuitView
@@ -255,7 +255,7 @@ class OptimizedPhaseCircuit:
         return OptimizedPhaseCircuit(self.phase_block, self.topology, self.cx_block,
                                      circuit_rep=self.circuit_rep, rng_seed=rng_seed)
 
-    def to_qiskit(self):
+    def to_qiskit(self, method: Literal["naive", "paritysynth"]):
         """
             Returns the optimized circuit as a Qiskit circuit.
 
@@ -273,8 +273,9 @@ class OptimizedPhaseCircuit:
             for ctrl, trgt in layer.gates:
                 circuit.cx(ctrl, trgt)
         for __ in range(self._circuit_rep):
-            for gadget in self._phase_block.gadgets:
-                gadget.on_qiskit_circuit(self._topology, circuit)
+            circuit.compose(self._phase_block.to_qiskit(self._topology, method), inplace=True)
+            # TODO Add the cnots from the back of the circuit to self._cx_block and re-synthesize them together
+
         for layer in self._cx_block:
             for ctrl, trgt in layer.gates:
                 circuit.cx(ctrl, trgt)
