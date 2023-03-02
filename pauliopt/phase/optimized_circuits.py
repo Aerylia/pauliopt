@@ -132,7 +132,7 @@ class OptimizedPhaseCircuit:
                  *,
                  circuit_rep: int = 1,
                  rng_seed: Optional[int] = None,
-                 fresh_angle_vars: Union[None, str, Callable[[int], AngleVar]] = None):
+                 fresh_angle_vars: Union[None, str, Callable[[int], AngleVar]] = None, method: Literal["naive", "paritysynth"] = "naive"):
         if not isinstance(phase_block, PhaseCircuit):
             raise TypeError(f"Expected PhaseCircuit, found {type(phase_block)}.")
         if not isinstance(topology, Topology):
@@ -158,7 +158,7 @@ class OptimizedPhaseCircuit:
         self._phase_block_view = PhaseCircuitView(self._phase_block)
         self._cx_block_view = CXCircuitView(self._cx_block)
         self._gadget_cx_count_cache = {}
-        self._init_cx_count, self._init_cx_blocks_count = self._compute_cx_count()
+        self._init_cx_count, self._init_cx_blocks_count = self._compute_cx_count(method)
         self._cx_count = self._init_cx_count
         self._cx_blocks_count = self._init_cx_blocks_count
         if isinstance(fresh_angle_vars, str):
@@ -272,14 +272,39 @@ class OptimizedPhaseCircuit:
         for layer in reversed(self._cx_block):
             for ctrl, trgt in layer.gates:
                 circuit.cx(ctrl, trgt)
+        if self._circuit_rep != 1 and method == "paritysynth":
+            raise NotImplementedError("ParitySynth is only implemented for circuits with a single repetition.")
         for __ in range(self._circuit_rep):
             circuit.compose(self._phase_block.to_qiskit(self._topology, method), inplace=True)
-            # TODO Add the cnots from the back of the circuit to self._cx_block and re-synthesize them together
 
-        for layer in self._cx_block:
-            for ctrl, trgt in layer.gates:
-                circuit.cx(ctrl, trgt)
-        return circuit
+        if method == "paritysynth":
+            intial_circuit = []
+            final_cnots = []
+            gather = True
+            for gate in reversed(circuit):
+                if gather and gate.operation.name == 'cx':
+                    final_cnots.append((gate.qubits[0].index, gate.qubits[1].index))
+                    gather = False
+                else:
+                    intial_circuit.append(gate)
+            new_initial_circuit = QuantumCircuit(self.num_qubits)
+            for g in reversed(intial_circuit):
+                new_initial_circuit.append(g)
+            CX_aggregate = CXCircuit(self.topology, [])
+            for gate in reversed(final_cnots):
+                CX_aggregate >>= CXCircuitLayer(self.topology, [gate])
+            CX_aggregate >>= self._cx_block
+            matrix = CX_aggregate._matrix
+            cnot_circuit = CXCircuit.from_parity_matrix(matrix, self.topology, reallocate=False)
+            for layer in cnot_circuit:
+                for ctrl,trgt in layer.gates:
+                    new_initial_circuit.cx(ctrl,trgt)
+            return new_initial_circuit
+        else:
+            for layer in self._cx_block:
+                for ctrl, trgt in layer.gates:
+                    circuit.cx(ctrl, trgt)
+            return circuit
 
     def simplify(self):
         """
@@ -298,7 +323,7 @@ class OptimizedPhaseCircuit:
     def anneal(self,
                num_iters: int, *,
                schedule: Union[StandardTempSchedule, TempSchedule] = ("linear", 1.0, 0.1),
-               loggers: AnnealingLoggers = {}):
+               loggers: AnnealingLoggers = {}, method: Literal["naive", "paritysynth"] = "naive"):
                # pylint: disable = dangerous-default-value
         # pylint: disable = too-many-locals
         """
@@ -407,13 +432,19 @@ class OptimizedPhaseCircuit:
         for cx in conj_by:
             self._phase_block.conj_by_cx(*cx)
 
-    def _compute_cx_count(self) -> Tuple[int, int]:
+    def _compute_cx_count(self, method: Literal["naive", "paritysynth"]="naive") -> Tuple[int, int]:
         # pylint: disable = protected-access
-        phase_block_cost = self._phase_block._cx_count(self._topology,
-                                                       self._gadget_cx_count_cache)
-        cx_blocks_count = 2*self._cx_block.num_gates
-        cx_count = self._circuit_rep*phase_block_cost + cx_blocks_count
-        return cx_count, cx_blocks_count
+        if method == "naive":
+            phase_block_cost = self._phase_block._cx_count(self._topology,
+                                                        self._gadget_cx_count_cache)
+            cx_blocks_count = 2*self._cx_block.num_gates
+            cx_count = self._circuit_rep*phase_block_cost + cx_blocks_count
+            return cx_count, cx_blocks_count
+        else:
+            cx_blocks_count = self._cx_block.num_gates
+            cx_count = self.to_qiskit(method).count_ops()['cx']
+            return cx_count, cx_blocks_count
+            
 
     def to_svg(self, *,
                zcolor: str = "#CCFFCC",

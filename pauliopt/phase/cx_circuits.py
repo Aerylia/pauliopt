@@ -3,14 +3,16 @@
     of circuits of mixed phase gadgets.
 """
 
+from collections import deque
 from typing import (cast, Collection, Dict, FrozenSet, Iterator, List,
-                    Optional, overload, Sequence, Tuple, Union)
+                    Optional, overload, Set, Sequence, Tuple, Union)
 import numpy as np # type: ignore
+import galois
 from pauliopt.topologies import Coupling, Topology, Matching
+from pauliopt.steiner_trees import prims_algorithm_branches, topDownMSTTraversal, bottomUpMSTTraversal
 
 
 GateLike = Union[List[int], Tuple[int, int]]
-
 
 class CXCircuitLayer:
     """
@@ -316,6 +318,10 @@ class CXCircuit(Sequence[CXCircuitLayer]):
                 raise ValueError("Layer topology different from circuit topology.")
         self._topology = topology
         self._layers = list(layers)
+        self._matrix = np.identity(topology.num_qubits)
+        for layer in layers:
+            for ctrl, trgt in layer.gates:
+                self._matrix[:,trgt] = (self._matrix[:,ctrl] + self._matrix[:,trgt]) % 2
 
     @property
     def topology(self) -> Topology:
@@ -345,6 +351,110 @@ class CXCircuit(Sequence[CXCircuitLayer]):
             Returns a copy of this CX circuit.
         """
         return CXCircuit(self.topology, [l.clone() for l in self])
+
+    def resynthesize(self, reallocate:bool=False) -> "CXCircuit":
+        return CXCircuit.from_parity_matrix(self._matrix, self.topology)
+
+    @staticmethod
+    def from_parity_matrix(matrix:Sequence[Sequence[int]], topology:Topology, reallocate:bool=False) -> "CXCircuit":
+        """
+            Returns an alternative realization of this circuit using synthesis.
+            In particular, we use the algorithm from https://arxiv.org/abs/2205.00724.
+
+            Reallocation is not yet implemented.
+        """
+        layers = []
+        m = np.asarray(matrix, dtype=np.int)
+        def add_cnot(ctrl, trgt):
+            m[ctrl] = (m[ctrl] + m[trgt]) %2
+            layers.append(CXCircuitLayer(topology, [(ctrl, trgt)]))
+            # print("CNOT", ctrl, trgt)
+            # print("update matrix:\n", m)
+        qubits_to_process = list(range(topology.num_qubits))
+        row_heuristic = lambda options, matrix: options[np.argmin([sum(matrix[o]) for o in options])]
+        if reallocate:
+            # TODO implement reallocation
+            raise NotImplementedError("Resynthesize does not yet work with dynamic placement")
+        else: 
+            column_heuristic = lambda row, matrix:row
+        while len(qubits_to_process) > 1:
+            possible_qubits = topology.non_cutting_qubits(qubits_to_process)
+            # print("Possible qubits", possible_qubits)
+            row = row_heuristic(possible_qubits, m)
+            column = column_heuristic(row, m) 
+
+            # print("Choose row", row, "from", qubits_to_process)
+            # print("Choose column to be the same as row:", column)
+
+            # reduce column:
+            col_nodes = [i for i in qubits_to_process if m[i, column]==1]
+            add_root = [] if m[row, column] == 1 else [row]
+            steiner_tree = prims_algorithm_branches(col_nodes + add_root,
+                                                    lambda u, v: 4*topology.subgraph_dist(u, v, qubits_to_process)-2,
+                                                    4*len(topology.qubits)-2)
+            edges = []
+            for edge in bottomUpMSTTraversal(steiner_tree, row, qubits_to_process):
+                if edge not in topology.couplings:
+                    path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process) 
+                    for new_edge in zip(path, path[1:]):
+                        edges.append(new_edge)
+                else:
+                    edges.append(edge)
+            # print(qubits_to_process, col_nodes, row, column)
+            # print(steiner_tree, edges)
+            for ctrl, trgt in edges:
+                if m[trgt,column] == 0:
+                    add_cnot(trgt, ctrl) # add lower node (edge[0]) to higher node (edge[1])
+            for ctrl, trgt in edges: # add the higher node (parent) to the lower node (child)
+                add_cnot(ctrl, trgt)
+            
+            # reduce row:
+            # print("reduce row")
+            # print(m)
+            ones_in_the_row = [i for i in qubits_to_process if m[row, i]== 1]
+            if len(ones_in_the_row) > 1:
+                # Solve the system of linear equations to find which rows to add together
+                submatrix = [[ m[i,j] for i in qubits_to_process if i != row] for j in qubits_to_process if j != column]
+                A = galois.GF(2)(submatrix)
+                A_inv = np.linalg.inv(A)
+                b = galois.GF(2)([m[row, i] for i in qubits_to_process if i != column], dtype=np.int)
+                X1 = np.matmul(A_inv, b)
+                # Add the row that we removed back in for easier indexing.
+                X = np.insert(X1, qubits_to_process.index(row), 1)
+                row_nodes = [qubits_to_process[i] for i in range(len(qubits_to_process)) if X[i] == 1]
+
+                steiner_tree = prims_algorithm_branches(row_nodes,
+                                                        lambda u, v: 4*topology.subgraph_dist(u, v, qubits_to_process)-2,
+                                                        4*len(topology.qubits)-2)
+                edges = []
+                for edge in topDownMSTTraversal(steiner_tree, row, qubits_to_process):
+                    if edge not in topology.couplings:
+                        path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process)
+                        for new_edge in zip(path, path[1:]):
+                            edges.append(new_edge)
+                    else:
+                        edges.append(edge)
+                # print(qubits_to_process, row_nodes, row, column)
+                # print("top down traversal", steiner_tree, edges)
+                for ctrl, trgt in edges: # Add every steiner node to its parent
+                    if trgt not in row_nodes:
+                        add_cnot(ctrl, trgt) 
+                edges = []
+                for edge in bottomUpMSTTraversal(steiner_tree, row, qubits_to_process):
+                    if edge not in topology.couplings:
+                        path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process)
+                        for new_edge in zip(path, path[1:]):
+                            edges.append(new_edge)
+                    else:
+                        edges.append(edge)
+                # print("bottom up traversal", steiner_tree, edges)
+                for ctrl, trgt in edges: # Add every node to its parent bottom-up
+                    add_cnot(trgt, ctrl)
+            # print("done. Removing row", row)
+            qubits_to_process.remove(row)
+
+        return CXCircuit(topology, layers)
+
 
     def draw(self, layout: str = "kamada_kawai", *,
              figsize: Optional[Tuple[int, int]] = None,
@@ -415,6 +525,9 @@ class CXCircuit(Sequence[CXCircuitLayer]):
                     raise TypeError(f"Expected a sequence of pairs of ints, found {layer}")
                 layer = CXCircuitLayer(self.topology, cast(Sequence[GateLike], layer))
             self._layers.append(layer)
+            # Update parity matrix
+            for ctrl, trgt in layer.gates:
+                self._matrix[:,trgt] = (self._matrix[:,ctrl] + self._matrix[:,trgt]) % 2
         return self
 
     def __rshift__(self, layers: Union[CXCircuitLayerLike,

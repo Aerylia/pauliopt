@@ -212,6 +212,21 @@ class Topology:
         g.add_edges_from(sorted(self.couplings, key=lambda c: c.as_pair))
         return g
 
+    def non_cutting_qubits(self, vertices:Sequence[int]=[]) -> List[int]:
+        try:
+            # pylint: disable = import-outside-toplevel
+            import networkx as nx # type: ignore
+        except ModuleNotFoundError as _:
+            raise ModuleNotFoundError("You must install the 'networkx' library.")
+        if len(vertices) == 0:
+            vertices = self.qubits
+        g = nx.Graph()
+        g.add_nodes_from(sorted(vertices))
+        g.add_edges_from(sorted([edge for edge in self.couplings if all([qubit in vertices for qubit in edge])], key=lambda c: c.as_pair))
+        cutting_vertices = list(nx.articulation_points(g))
+        return [v for v in vertices if v not in cutting_vertices]
+
+
     def draw(self, layout: str = "kamada_kawai", *,
              figsize: Optional[Tuple[int, int]] = None,
              filename: Optional[str] = None,
@@ -284,6 +299,27 @@ class Topology:
         if not isinstance(to, int) or to not in self:
             raise TypeError(f"Expected a valid qubit, found {to}.")
         return self._dist[fro, to]
+
+    def subgraph_dist(self, fro:int, to:int, vertices:Sequence[int]) -> int:
+        try:
+            # pylint: disable = import-outside-toplevel
+            import networkx as nx # type: ignore
+        except ModuleNotFoundError as e: # pylint: disable = unused-variable
+            raise ModuleNotFoundError("You must install the 'networkx' library.")
+        g = self.to_nx
+        new_g = g.subgraph(vertices)
+        return nx.shortest_path_length(new_g, fro, to)
+
+    def subgraph_dijkstra(self, fro:int, to:int, vertices:Sequence[int]) -> Sequence[int]:
+        try:
+            # pylint: disable = import-outside-toplevel
+            import networkx as nx # type: ignore
+        except ModuleNotFoundError as e: # pylint: disable = unused-variable
+            raise ModuleNotFoundError("You must install the 'networkx' library.")
+        g = self.to_nx
+        new_g = g.subgraph(vertices)
+        return nx.dijkstra_path(new_g, fro, to)
+
 
     def mapped_fwd(self, mapping: Union[Sequence[int], Dict[int, int]]) -> "Topology":
         """
