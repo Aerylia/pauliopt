@@ -366,7 +366,7 @@ class CXCircuit(Sequence[CXCircuitLayer]):
         layers = []
         m = np.asarray(matrix, dtype=np.int)
         def add_cnot(ctrl, trgt):
-            m[ctrl] = (m[ctrl] + m[trgt]) %2
+            m[ctrl,:] = (m[ctrl,:] + m[trgt,:]) %2
             layers.append(CXCircuitLayer(topology, [(ctrl, trgt)]))
             # print("CNOT", ctrl, trgt)
             # print("update matrix:\n", m)
@@ -379,6 +379,8 @@ class CXCircuit(Sequence[CXCircuitLayer]):
             column_heuristic = lambda row, matrix:row
         while len(qubits_to_process) > 1:
             possible_qubits = topology.non_cutting_qubits(qubits_to_process)
+            m_at_start_of_iteration = [[m[r,c] for c in range(topology.num_qubits)] for r in range(topology.num_qubits)]
+            cnots_this_iteration = []
             # print("Possible qubits", possible_qubits)
             row = row_heuristic(possible_qubits, m)
             column = column_heuristic(row, m) 
@@ -397,6 +399,10 @@ class CXCircuit(Sequence[CXCircuitLayer]):
                 if edge not in topology.couplings:
                     path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process) 
                     for new_edge in zip(path, path[1:]):
+                        if (new_edge[1], new_edge[0]) in edges:
+                            edges.remove((new_edge[1], new_edge[0]))
+                        if new_edge in edges:
+                            edges.remove(new_edge)    
                         edges.append(new_edge)
                 else:
                     edges.append(edge)
@@ -405,15 +411,31 @@ class CXCircuit(Sequence[CXCircuitLayer]):
             for ctrl, trgt in edges:
                 if m[trgt,column] == 0:
                     add_cnot(trgt, ctrl) # add lower node (edge[0]) to higher node (edge[1])
+                    cnots_this_iteration.append((trgt, ctrl))
             for ctrl, trgt in edges: # add the higher node (parent) to the lower node (child)
                 add_cnot(ctrl, trgt)
+                cnots_this_iteration.append((ctrl, trgt))
             
+            # Sanity check1:
+            if sum(m[:,column]) != 1 or m[row, column] != 1:
+                print("The column was not properly reduced! This should never happen.")
+                print("We picked row", row, "and column", column, "from", qubits_to_process)
+                print("Column nodes", col_nodes)
+                print("We created the Steiner Tree and traversed the edges:", edges)
+                print("The matrix was ")
+                print(m_at_start_of_iteration)
+                print(cnots_this_iteration)
+                print("The matrix is now")
+                print(m)
+
             # reduce row:
-            # print("reduce row")
-            # print(m)
+            #print("reduce row")
+            #print(m)
             ones_in_the_row = [i for i in qubits_to_process if m[row, i]== 1]
             if len(ones_in_the_row) > 1:
                 # Solve the system of linear equations to find which rows to add together
+                m_at_start_of_row_reduce = [[m[r,c] for c in range(topology.num_qubits)] for r in range(topology.num_qubits)]
+                cnots_this_step = []
                 submatrix = [[ m[i,j] for i in qubits_to_process if i != row] for j in qubits_to_process if j != column]
                 A = galois.GF(2)(submatrix)
                 A_inv = np.linalg.inv(A)
@@ -431,26 +453,50 @@ class CXCircuit(Sequence[CXCircuitLayer]):
                     if edge not in topology.couplings:
                         path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process)
                         for new_edge in zip(path, path[1:]):
-                            edges.append(new_edge)
+                            if (new_edge[1], new_edge[0]) not in edges:
+                                if new_edge not in edges:
+                                    edges.append(new_edge)
                     else:
                         edges.append(edge)
-                # print(qubits_to_process, row_nodes, row, column)
-                # print("top down traversal", steiner_tree, edges)
+                #print(qubits_to_process, row_nodes, row, column)
+                #print("top down traversal", steiner_tree, edges)
                 for ctrl, trgt in edges: # Add every steiner node to its parent
                     if trgt not in row_nodes:
                         add_cnot(ctrl, trgt) 
-                edges = []
+                        cnots_this_step.append((ctrl, trgt))
+                edges2 = []
                 for edge in bottomUpMSTTraversal(steiner_tree, row, qubits_to_process):
                     if edge not in topology.couplings:
                         path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process)
                         for new_edge in zip(path, path[1:]):
-                            edges.append(new_edge)
+                            if (new_edge[1], new_edge[0]) in edges2:
+                                edges2.remove((new_edge[1], new_edge[0]))
+                            if new_edge in edges2:
+                                edges2.remove(new_edge)
+                            edges2.append(new_edge) 
                     else:
-                        edges.append(edge)
-                # print("bottom up traversal", steiner_tree, edges)
-                for ctrl, trgt in edges: # Add every node to its parent bottom-up
-                    add_cnot(trgt, ctrl)
-            # print("done. Removing row", row)
+                        edges2.append(edge)
+                #print("bottom up traversal", steiner_tree, edges2)
+                for trgt, ctrl in edges2: # Add every node to its parent bottom-up
+                    add_cnot(ctrl, trgt)
+                    cnots_this_step.append((ctrl, trgt))
+                # Sanity check 2
+                if sum(m[row,:]) != 1 or m[row, column] != 1:
+                    print("The row was not properly reduced!")
+                    print("We picked row", row, "and column", column, "from", qubits_to_process)
+                    print("The terminals are", row_nodes)
+                    print("The matrix was")
+                    print(*m_at_start_of_row_reduce, sep="\n")
+                    print("We created the Steiner Tree", steiner_tree, " and traversed the edges top-down:", edges)
+                    print("We created the Steiner Tree and traversed the edges bottom-up:", edges2)
+                    print("Applied CNOTs are", cnots_this_step)
+            # Sanity check 3
+            if sum(m[row,:]) != 1 or m[row, column] != 1 or sum(m[:, column]) != 1:
+                print("The matrix is not properly reduced in one of the previous steps.")
+                print("The matrix is now and we cannot remove row", row)
+                print(m)
+                return None
+            #print("done. Removing row", row)
             qubits_to_process.remove(row)
 
         return CXCircuit(topology, layers)

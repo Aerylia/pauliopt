@@ -348,7 +348,7 @@ class OptimizedPhaseCircuit:
         for it in range(num_iters):
             t = schedule(it, num_iters=num_iters)
             layer_idx, (ctrl, trgt) = self.random_flip_cx()
-            new_cx_count, new_cx_blocks_count = self._compute_cx_count()
+            new_cx_count, new_cx_blocks_count = self._compute_cx_count(method)
             cx_count_diff = new_cx_count-self._cx_count
             accept_step = cx_count_diff < 0 or rand[it] < np.exp(-np.log(2)*cx_count_diff/t)
             if log_iter is not None:
@@ -442,7 +442,10 @@ class OptimizedPhaseCircuit:
             return cx_count, cx_blocks_count
         else:
             cx_blocks_count = self._cx_block.num_gates
-            cx_count = self.to_qiskit(method).count_ops()['cx']
+            cx_count = 0
+            ops = self.to_qiskit(method).count_ops()
+            if "cx" in ops:
+                cx_count = ops["cx"]
             return cx_count, cx_blocks_count
             
 
