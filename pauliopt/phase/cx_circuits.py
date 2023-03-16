@@ -464,20 +464,8 @@ class CXCircuit(Sequence[CXCircuitLayer]):
                     if trgt not in row_nodes:
                         add_cnot(ctrl, trgt) 
                         cnots_this_step.append((ctrl, trgt))
-                edges2 = []
-                for edge in bottomUpMSTTraversal(steiner_tree, row, qubits_to_process):
-                    if edge not in topology.couplings:
-                        path = topology.subgraph_dijkstra(edge[0], edge[1], qubits_to_process)
-                        for new_edge in zip(path, path[1:]):
-                            if (new_edge[1], new_edge[0]) in edges2:
-                                edges2.remove((new_edge[1], new_edge[0]))
-                            if new_edge in edges2:
-                                edges2.remove(new_edge)
-                            edges2.append(new_edge) 
-                    else:
-                        edges2.append(edge)
-                #print("bottom up traversal", steiner_tree, edges2)
-                for trgt, ctrl in edges2: # Add every node to its parent bottom-up
+
+                for ctrl, trgt in reversed(edges): # Add every node to its parent bottom-up
                     add_cnot(ctrl, trgt)
                     cnots_this_step.append((ctrl, trgt))
                 # Sanity check 2

@@ -804,6 +804,8 @@ class PhaseCircuit(Sequence[PhaseGadget]):
             raise TypeError(f"Expected Topology, found {type(topology)}.")
         # print(self._gadget_idxs)
         # print(self.gadgets)
+        if len(self.gadgets) == 0:
+            return # done
         block_indices = []
         current_basis = self.gadgets[0].basis
         current_block = []
