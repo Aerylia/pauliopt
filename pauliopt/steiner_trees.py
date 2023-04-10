@@ -2,7 +2,6 @@
 from collections import deque
 from typing import (Any, Callable, cast, Collection, Dict, FrozenSet, Iterator, List,
                     Literal, Mapping, Optional, overload, Sequence, Set, Tuple, Union)
-from pauliopt.topologies import Topology
 
 def prims_algorithm_weight(nodes: Collection[int], weight: Callable[[int, int], int],
                             inf: int) -> int:
@@ -126,41 +125,25 @@ def prims_algorithm_full(nodes: Collection[int], weight: Callable[[int, int], in
 
 def topDownMSTTraversal(tree:Sequence[Tuple[int, int]], root:int, vertices:Sequence[int]) -> Sequence[Tuple[int,int]]:
     edges = []
-    incident: Dict[int, Set[Tuple[int, int]]] = {q: set() for q in vertices}
-    for fst, snd in tree:
-        incident[fst].add((fst, snd))
-        incident[snd].add((snd, fst))
-    visited: Set[int] = set()
-    queue = deque([root])
-    while queue:
-        q = queue.popleft()
-        visited.add(q)
-        for head, tail in incident[q]:
-            if tail not in visited:
-                edges.append((head, tail))
-                queue.append(tail)
+    if tree:
+        incident: Dict[int, Set[Tuple[int, int]]] = {q: set() for q in vertices}
+        for fst, snd in tree:
+            incident[fst].add((fst, snd))
+            incident[snd].add((snd, fst))
+        visited: Set[int] = set()
+        queue = deque([root])
+        while queue:
+            q = queue.popleft()
+            visited.add(q)
+            for head, tail in incident[q]:
+                if tail not in visited:
+                    edges.append((head, tail))
+                    queue.append(tail)
     return edges
 
 def bottomUpMSTTraversal(tree:Sequence[Tuple[int, int]], root:int, vertices:Sequence[int]) -> Sequence[Tuple[int,int]]:
     edges = [(t, h) for h,t in topDownMSTTraversal(tree, root, vertices)]
     edges.reverse()
     return edges
-    edges = []
-    incident: Dict[int, Set[Tuple[int, int]]] = {q: set() for q in vertices}
-    for fst, snd in tree:
-        incident[fst].add((fst, snd))
-        incident[snd].add((snd, fst))
-    visited: Set[int] = set()
-    queue = deque([v for v in vertices if v != root])
-    while queue:
-        q = queue.popleft()
-        visited.add(q)
-        for head, tail in incident[q]: # Edges are traversed in reverse direction wrt _preOrderTraversalEdges
-            if tail not in visited:
-                edges.append((head, tail))
-                if tail != root:
-                    queue.append(tail)
-                else: 
-                    visited.add(tail)
-    return edges
+
 

@@ -7,6 +7,7 @@ from typing import (Collection, Dict, Final, FrozenSet, Iterator, List, Mapping,
                     Optional, Sequence, Set, Tuple, TypedDict, Union)
 import numpy as np
 import numpy.typing as npt
+from pauliopt.steiner_trees import prims_algorithm_branches, topDownMSTTraversal, bottomUpMSTTraversal
 
 class Coupling(FrozenSet[int]):
     """
@@ -319,7 +320,44 @@ class Topology:
         g = self.to_nx
         new_g = g.subgraph(vertices)
         return nx.dijkstra_path(new_g, fro, to)
-
+    
+    def Steiner_tree_topdown(self, root:int, terminals:Sequence[int], subgraph:Sequence[int]=[]) -> Sequence[Tuple[int, int]]:
+        if len(subgraph) == 0:
+            subgraph = self.qubits
+        steiner_tree = prims_algorithm_branches(terminals,
+                                                lambda u, v: 4*self.subgraph_dist(u, v, subgraph)-2,
+                                                4*len(self.qubits)-2)
+        edges = []
+        for edge in topDownMSTTraversal(steiner_tree, root, subgraph):
+            if edge not in self.couplings:
+                path = self.subgraph_dijkstra(edge[0], edge[1], subgraph)
+                for new_edge in zip(path, path[1:]):
+                    if (new_edge[1], new_edge[0]) not in edges:
+                        if new_edge not in edges:
+                            edges.append(new_edge)
+            else:
+                edges.append(edge)
+        return edges
+    
+    def Steiner_tree_bottomup(self, root:int, terminals:Sequence[int], subgraph:Sequence[int]=[]) -> Sequence[Tuple[int, int]]:
+        if len(subgraph) == 0:
+            subgraph = self.qubits
+        steiner_tree = prims_algorithm_branches(terminals,
+                                                lambda u, v: 4*self.subgraph_dist(u, v, subgraph)-2,
+                                                4*len(self.qubits)-2)
+        edges = []
+        for edge in bottomUpMSTTraversal(steiner_tree, root, subgraph):
+            if edge not in self.couplings:
+                path = self.subgraph_dijkstra(edge[0], edge[1], subgraph) 
+                for new_edge in zip(path, path[1:]):
+                    if (new_edge[1], new_edge[0]) in edges:
+                        edges.remove((new_edge[1], new_edge[0]))
+                    if new_edge in edges:
+                        edges.remove(new_edge)    
+                    edges.append(new_edge)
+            else:
+                edges.append(edge)
+        return edges
 
     def mapped_fwd(self, mapping: Union[Sequence[int], Dict[int, int]]) -> "Topology":
         """

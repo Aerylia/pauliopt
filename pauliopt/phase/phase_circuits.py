@@ -13,7 +13,7 @@ import numpy.typing as npt
 from pauliopt.qasm import QASM
 from pauliopt.topologies import Topology
 from pauliopt.utils import Angle, AngleExpr, AngleVar, SVGBuilder, pi
-from pauliopt.steiner_trees import prims_algorithm_weight, prims_algorithm_full, prims_algorithm_branches
+from pauliopt.steiner_trees import prims_algorithm_weight, prims_algorithm_full
 from pauliopt.phase.cx_circuits import CXCircuit, CXCircuitLayer
 
 def _frozenset_to_int(s: FrozenSet[int]) -> int:
@@ -104,7 +104,7 @@ class PhaseGadget:
                 then trgt qubit gets a leg if it didn't
                     or trgt qubit loses a leg if it had one.
         """
-        qubits = [q for q in self.qubits]
+        qubits = [q for q in self._qubits]
         if self.basis == "Z":
             leg_to_check = trgt
             leg_to_change = ctrl
@@ -175,41 +175,32 @@ class PhaseGadget:
         else:
             q0 = min(*self._qubits)
         cx_ladder = self.CXLadder(topology, q0)
-        for ctrl, trgt in reversed(cx_ladder):
+        for ctrl, trgt in cx_ladder:
             circuit.cx(ctrl, trgt)
         if self.basis == "Z":
             circuit.rz(self.angle.to_qiskit, q0)
         else:
             circuit.rx(self.angle.to_qiskit, q0)
-        for ctrl, trgt in cx_ladder:
+        for ctrl, trgt in reversed(cx_ladder):
             circuit.cx(ctrl, trgt)
 
     def CXLadder(self, topology:Topology, root:int) -> List[Tuple[int, int]]:
-        mst_branches = prims_algorithm_branches(self._qubits,
-                                                    lambda u, v: 4*topology.dist(u, v)-2,
-                                                    4*len(topology.qubits)-2)
-        ladder: List[Tuple[int, int]] = []
-        if mst_branches:
-            incident: Dict[int, Set[Tuple[int, int]]] = {
-                q: set() for q in self._qubits
-            }
-            for fst, snd in mst_branches:
-                incident[fst].add((fst, snd))
-                incident[snd].add((snd, fst))
-            # Create ladder of CX gates:
-            visited: Set[int] = set()
-            queue = deque([root])
-            while queue:
-                q = queue.popleft()
-                visited.add(q)
-                for tail, head in incident[q]:
-                    if head not in visited:
-                        if self.basis == "Z":
-                            ladder.append((head, tail))
-                        else:
-                            ladder.append((tail, head))
-                        queue.append(head)
-        return ladder
+        if self.basis == "Z":
+            ladder = topology.Steiner_tree_bottomup(root, self._qubits)
+        else: 
+            ladder = topology.Steiner_tree_topdown(root, self._qubits)
+            ladder.reverse()
+        cnots = []
+        visited_steiner_nodes = []
+        for ctrl, trgt in ladder:
+            if (self.basis == "Z" and trgt not in self._qubits) and trgt not in visited_steiner_nodes:
+                cnots.append((trgt,ctrl))
+                visited_steiner_nodes.append(trgt)
+            elif (self.basis == "X" and ctrl not in self._qubits) and ctrl not in visited_steiner_nodes:
+                cnots.append((trgt,ctrl))
+                visited_steiner_nodes.append(ctrl)
+            cnots.append((ctrl,trgt))
+        return cnots
 
     def print_impl_info(self, topology: Topology) -> None:
         """
@@ -761,7 +752,7 @@ class PhaseCircuit(Sequence[PhaseGadget]):
         ]
         return PhaseCircuit(self._num_qubits, remapped_gadgets)
 
-    def to_qiskit(self, topology: Topology, method: Literal["naive", "paritysynth"] = "paritysynth") -> Any:
+    def to_qiskit(self, topology: Topology, method: Literal["naive", "paritysynth", "steiner-graysynth"] = "paritysynth", reallocate:bool=False) -> Any:
         """
             Returns this circuit as a Qiskit circuit.
 
@@ -781,12 +772,14 @@ class PhaseCircuit(Sequence[PhaseGadget]):
             for gadget in self.gadgets:
                 gadget.on_qiskit_circuit(topology, circuit)
         elif method == "paritysynth":
-            self._paritysynth(topology, circuit)
+            self._paritysynth(topology, circuit, reallocate=reallocate)
+        elif method == "steiner-graysynth":
+            self._steinerGraySynth(topology, circuit, reallocate=reallocate)
         else:
             raise TypeError("Expected one of 'naive', 'steiner-graysynth', 'paritysynth, found {method}.")
         return circuit
 
-    def _paritysynth(self, topology: Topology, circuit: Any) -> None:
+    def _paritysynth(self, topology: Topology, circuit: Any, reallocate:bool=False) -> None:
         """
             Implementation for synthesizing the this PhaseCircuit 
             to a Qiskit Quantum circuit using the method from 
@@ -802,8 +795,7 @@ class PhaseCircuit(Sequence[PhaseGadget]):
                             "`qiskit.circuit.QuantumCircuit`.")
         if not isinstance(topology, Topology):
             raise TypeError(f"Expected Topology, found {type(topology)}.")
-        # print(self._gadget_idxs)
-        # print(self.gadgets)
+        
         if len(self.gadgets) == 0:
             return # done
         block_indices = []
@@ -819,7 +811,29 @@ class PhaseCircuit(Sequence[PhaseGadget]):
         block_indices.append(current_block)
         # print(block_indices)
         all_gadgets = [g.copy() for g in self.gadgets] # copies the gadgets so they can change.
+        finished_gadgets = []
         CX_aggregate = []
+
+        def pick_root(gadget, remaining_gadgets):
+            # print("Remaining gadgets", remaining_gadgets)
+            best_tree, best_root, best_score = None, None, None
+            flip_basis = lambda b: "Z" if b == "X" else "X"
+            for root in gadget.qubits:
+                matrices = [np.array(m, copy=True) for m in remaining_gadgets if len(m)>0] 
+                # print("matrix", matrices)
+                tree = gadget.CXLadder(topology, root)
+                for ctrl, trgt in tree:
+                    basis = gadget.basis
+                    for matrix in matrices:
+                        if basis == "Z":
+                            matrix[:,ctrl] = (matrix[:, ctrl] + matrix[:,trgt]) % 2
+                        else:
+                            matrix[:,trgt] = (matrix[:, ctrl] + matrix[:, trgt]) % 2
+                        basis = flip_basis(basis)
+                score = sum(np.sum(m) for m in matrices) # The orignal paper wanted argmin(sort()) which is ill-defined. I took the liberty to use h(P^X) instead 
+                if not best_score or best_score > score:
+                    best_tree, best_root, best_score = tree, root, score
+            return best_tree, best_root
 
         for block in block_indices:
             #current_gadgets = [all_gadgets[i] for i in block]
@@ -827,64 +841,175 @@ class PhaseCircuit(Sequence[PhaseGadget]):
                 # Pick the cheapest gadget
                 index = block[np.argmin([all_gadgets[i].cx_count(topology) for i in block])]
                 gadget = all_gadgets[index]
-                # Remove that parity from the matrix
-                block.remove(index)
-                # Find the terminals in the parity
-                terminals = gadget.qubits
-
-                # Build a SteinerTree
-                mst_branches = prims_algorithm_branches(terminals,
-                                                    lambda u, v: 4*topology.dist(u, v)-2,
-                                                    4*len(topology.qubits)-2)
-                upper_ladder: List[Tuple[int, int]] = []
-                if len(terminals) == 1:
-                    q0 = next(iter(terminals))
-                else:
-                    q0 = min(*terminals)
-                if mst_branches:
-                    incident: Dict[int, Set[Tuple[int, int]]] = {
-                        q: set() for q in terminals
-                    }
-                    for fst, snd in mst_branches:
-                        incident[fst].add((fst, snd))
-                        incident[snd].add((snd, fst))
-                    # Create ladder of CX gates:
-                    visited: Set[int] = set()
-                    queue = deque([q0])
-                    while queue:
-                        q = queue.popleft()
-                        visited.add(q)
-                        for tail, head in incident[q]:
-                            if head not in visited:
-                                if gadget.basis == "Z":
-                                    upper_ladder.append((head, tail))
-                                else:
-                                    upper_ladder.append((tail, head))
-                                queue.append(head)
-                for ctrl, trgt in reversed(upper_ladder):
-                    circuit.cx(ctrl, trgt)
-                if gadget.basis == "Z":
-                    circuit.rz(gadget.angle.to_qiskit, q0)
-                else:
-                    circuit.rx(gadget.angle.to_qiskit, q0)
-                # Push the upper CX laddder through the remaining gadgets
-                for ctrl, trgt in reversed(upper_ladder):
+                # print("Terminals", gadget.qubits, gadget.basis)
+                # Get the CX ladder for the gaddget
+                upper_ladder = gadget.CXLadder(topology, next(iter(gadget._qubits)))
+                #print("chosen gadget", gadget.basis, gadget._angle, gadget.qubits, upper_ladder)
+                #print("before", [g for i,g in enumerate(all_gadgets) if i not in finished_gadgets])
+                
+                # Fill in the gadget
+                cnots_used = []
+                for trgt, ctrl in upper_ladder:
+                    if (gadget.basis == "Z" and ctrl not in gadget._qubits):
+                        circuit.cx(ctrl, trgt)
+                        cnots_used.append((ctrl, trgt))
+                    elif (gadget.basis == "X" and trgt not in gadget._qubits):
+                        circuit.cx(ctrl, trgt)
+                        cnots_used.append((ctrl, trgt))
+                for ctrl, trgt in cnots_used:
                     # print("pushing cnot", ctrl, trgt)
                     for g in all_gadgets:
-                        #print("g before", g)
                         g.push_CX_through(ctrl, trgt)
-                        #print("g after", g)
                     CX_aggregate.append((ctrl, trgt))
-        # TODO Maybe we want to do this optimization later and include the annealing CXs.
-        # TODO Implement reallocation
+                # print("The gadget should be filled in", gadget._qubits)
+
+                remaining_gadgets = [np.array([[int(q in all_gadgets[i].qubits) for q in range(topology.num_qubits)]
+                                     for i in block if i not in finished_gadgets] )
+                                     for block in block_indices]
+                upper_ladder, root = pick_root(gadget, remaining_gadgets)
+                for ctrl, trgt in upper_ladder:
+                    circuit.cx(ctrl, trgt)
+
+                if gadget.basis == "Z":
+                    circuit.rz(gadget.angle.to_qiskit, root)
+                else:
+                    circuit.rx(gadget.angle.to_qiskit, root)
+                # Push the upper CX laddder through the remaining gadgets
+                for ctrl, trgt in upper_ladder:
+                    #print("pushing cnot", ctrl, trgt)
+                    for g in all_gadgets:
+                        g.push_CX_through(ctrl, trgt)
+                    CX_aggregate.append((ctrl, trgt))
+                #print("after", [g for i,g in enumerate(all_gadgets) if i not in finished_gadgets])
+                # Sanity check:
+                assert(len(all_gadgets[index].qubits) == 1, "The chosen gadget was not properly reduced and cannot be removed.")
+                # Remove that parity from the matrix
+                block.remove(index)
+                finished_gadgets.append(index)
+                    
         no_topology = Topology.complete(topology.num_qubits)
-        cnots_parity_matrix = CXCircuit(no_topology, [CXCircuitLayer(no_topology, [cnot]) for cnot in reversed(CX_aggregate)])._matrix
+        cnots_circuit = CXCircuit(no_topology, [CXCircuitLayer(no_topology, [cnot]) for cnot in reversed(CX_aggregate)])
+        cnots_parity_matrix = cnots_circuit._matrix
         # print(cnots_parity_matrix)
-        new_cnots = CXCircuit.from_parity_matrix(cnots_parity_matrix, topology, reallocate=False)
+        new_cnots = CXCircuit.from_parity_matrix(cnots_parity_matrix, topology, reallocate=reallocate)
         # print(new_cnots._matrix)
-        for cxlayer in new_cnots:
-            for ctrl, trgt in cxlayer.gates:
+        # Only take the newly generated circuit if it is better.
+        if cnots_circuit.num_gates <= new_cnots.num_gates:
+            chosen_circuit = cnots_circuit
+        else:
+            chosen_circuit = new_cnots
+        for layer in chosen_circuit:
+            for ctrl, trgt in layer.gates:
                 circuit.cx(ctrl, trgt)
+        circuit.metadata = {
+            "final_layout": chosen_circuit.output_qubit_mapping
+        }
+
+    def _steinerGraySynth(self, topology: Topology, circuit: Any, reallocate:bool=False) -> None:
+        try:
+            from qiskit.circuit import QuantumCircuit # type: ignore
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("You must install the 'qiskit' library.") from e
+        if not isinstance(circuit, QuantumCircuit):
+            raise TypeError("Argument 'circuit' must be of type "
+                            "`qiskit.circuit.QuantumCircuit`.")
+        if not isinstance(topology, Topology):
+            raise TypeError(f"Expected Topology, found {type(topology)}.")
+        
+        if len(self.gadgets) == 0:
+            return # done
+        block_indices = []
+        current_basis = self.gadgets[0].basis
+        current_block = []
+        for i,gadget in enumerate(self.gadgets):
+            if gadget.basis == current_basis:
+                current_block.append(i)
+            else:
+                block_indices.append(current_block)
+                current_basis = gadget.basis
+                current_block = [i]
+        block_indices.append(current_block)
+        # print(block_indices)
+        all_gadgets = [g.copy() for g in self.gadgets] # copies the gadgets so they can change.
+        finished_gadgets = []
+        CX_aggregate = []
+
+        def place_cnot(ctrl, trgt, basis):
+            if basis == "Z":
+                circuit.cx(ctrl,trgt)
+                CX_aggregate.append((ctrl,trgt))
+                for g in all_gadgets:
+                    g.push_CX_through(ctrl, trgt)
+            else:
+                place_cnot(trgt, ctrl, "Z")
+
+        def ones_recursion(gadgets, subgraph, row):
+            if gadgets:
+                basis = gadgets[0].basis
+                neighbors = [q for q in iter(topology.adjacent(row)) if q in subgraph]
+                n = neighbors[np.argmax([len([g for g in gadgets if q in g.qubits]) for q in neighbors])]
+                #print("ones", subgraph, gadgets, row, neighbors, n)
+                if len([g for g in gadgets if n in g.qubits]) > 0:
+                    place_cnot(row, n, basis)
+                    for gadget in gadgets:
+                        qubits = [q for q in subgraph if q in gadget.qubits]
+                        #print("checking gadget", gadget, qubits)
+                        if len(qubits) == 1:
+                            qubit = qubits[0]
+                            if basis == "Z":
+                                circuit.rz(gadget.angle.to_qiskit, qubit)
+                            else:
+                                circuit.rx(gadget.angle.to_qiskit, qubit)
+                            gadgets.remove(gadget)
+                            #print("Removed gadget", gadget)
+                else:
+                    place_cnot(n, row, basis)
+                    place_cnot(row, n, basis)
+                zeroes = [g for g in gadgets if row not in g.qubits]
+                ones = [g for g in gadgets if row in g.qubits]
+                zeroes_recursion(zeroes, [i for i in subgraph if i != row])
+                ones_recursion(ones, [i for i in subgraph], row)
+
+        def zeroes_recursion(gadgets, subgraph):
+            if subgraph and gadgets:
+                rows = topology.non_cutting_qubits(subgraph)
+                counts = [[len(g.qubits) for g in gadgets if r in g.qubits] for r in rows]
+                row = rows[np.argmax([np.max(counts[i]) if counts[i] else topology.num_qubits for i,r in enumerate(rows) ]) ]
+                zeroes = [g for g in gadgets if row not in g.qubits]
+                ones = [g for g in gadgets if row in g.qubits]
+                zeroes_recursion(zeroes, [i for i in subgraph if i != row])
+                ones_recursion(ones, [i for i in subgraph], row)
+
+        for block in block_indices:
+            finished_gadgets = []
+            for i in block:
+                gadget = all_gadgets[i] 
+                if len(gadget.qubits) == 1:
+                    qubit = next(iter(gadget.qubits))
+                    if gadget.basis == "Z":
+                        circuit.rz(gadget.angle.to_qiskit, qubit)
+                    else:
+                        circuit.rx(gadget.angle.to_qiskit, qubit)
+                    finished_gadgets.append(i)
+            zeroes_recursion([all_gadgets[i] for i in block if i not in finished_gadgets], [i for i in range(topology.num_qubits)])
+            
+        no_topology = Topology.complete(topology.num_qubits)
+        cnots_circuit = CXCircuit(no_topology, [CXCircuitLayer(no_topology, [cnot]) for cnot in reversed(CX_aggregate)])
+        cnots_parity_matrix = cnots_circuit._matrix
+        # print(cnots_parity_matrix)
+        new_cnots = CXCircuit.from_parity_matrix(cnots_parity_matrix, topology, reallocate=reallocate)
+        # print(new_cnots._matrix)
+        # Only take the newly generated circuit if it is better.
+        if cnots_circuit.num_gates <= new_cnots.num_gates:
+            chosen_circuit = cnots_circuit
+        else:
+            chosen_circuit = new_cnots
+        for layer in chosen_circuit:
+            for ctrl, trgt in layer.gates:
+                circuit.cx(ctrl, trgt)
+        circuit.metadata = {
+            "final_layout": chosen_circuit.output_qubit_mapping
+        }
 
 
     @overload
@@ -1366,7 +1491,7 @@ class PhaseCircuit(Sequence[PhaseGadget]):
             col = self._matrix[basis][:, col_idx]
             yield PhaseGadget(basis, angle, {i for i, b in enumerate(col) if b % 2 == 1})
 
-    def _cx_count(self, topology: Topology, cache: Dict[int, Dict[Tuple[int, ...], int]], method: Literal["naive", "paritysynth"] = "naive") -> int:
+    def _cx_count(self, topology: Topology, cache: Dict[int, Dict[Tuple[int, ...], int]], method: Literal["naive", "paritysynth", "steiner-graysynth"] = "naive") -> int:
         """
             Returns the CX count for an implementation of this phase circuit
             on the given topology based on minimum spanning trees (MST).
