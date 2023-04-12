@@ -797,6 +797,9 @@ class PhaseCircuit(Sequence[PhaseGadget]):
             raise TypeError(f"Expected Topology, found {type(topology)}.")
         
         if len(self.gadgets) == 0:
+            circuit.metadata = {
+                "final_layout": [i for i in range(topology.num_qubits)]
+            }
             return # done
         block_indices = []
         current_basis = self.gadgets[0].basis
@@ -917,6 +920,9 @@ class PhaseCircuit(Sequence[PhaseGadget]):
             raise TypeError(f"Expected Topology, found {type(topology)}.")
         
         if len(self.gadgets) == 0:
+            circuit.metadata = {
+                "final_layout": [i for i in range(topology.num_qubits)]
+            }
             return # done
         block_indices = []
         current_basis = self.gadgets[0].basis
