@@ -1,0 +1,11 @@
+galois==0.3.5
+matplotlib==3.7.1
+networkx==2.6.2
+notebook==6.5.4
+numpy==1.23.5
+pandas==2.0.2
+pip==23.1.2
+pytket==1.11.0
+pytket-qiskit==0.34.0
+pyzx==0.8.0
+qiskit==0.39.5
